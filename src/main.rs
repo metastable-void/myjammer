@@ -9,7 +9,6 @@ const SAMPLE_RATE: u32 = 48_000;
 const CHUNK_SIZE: usize = 4096;
 const MIN_FREQ: f32 = 60.0;
 const MAX_FREQ: f32 = 1000.0;
-const MIN_OUTPUT_GAIN: f32 = 0.05;
 const MAX_OUTPUT_GAIN: f32 = 0.8;
 const GAIN_SMOOTHING: f32 = 0.15;
 
@@ -28,7 +27,7 @@ fn run() -> Result<()> {
     let mut output = [0i16; CHUNK_SIZE];
     let mut phase = 0.0f32;
     let mut last_reported = 0.0f32;
-    let mut current_gain = MIN_OUTPUT_GAIN;
+    let mut current_gain = 0.0f32;
 
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
@@ -42,7 +41,7 @@ fn run() -> Result<()> {
         }
 
         let level = rms_level(&input);
-        let target_gain = MIN_OUTPUT_GAIN + level * (MAX_OUTPUT_GAIN - MIN_OUTPUT_GAIN);
+        let target_gain = (level * MAX_OUTPUT_GAIN).min(MAX_OUTPUT_GAIN);
         current_gain += (target_gain - current_gain) * GAIN_SMOOTHING;
 
         let target_freq = pitch.map(|f| f * SQRT_2).unwrap_or(0.0);
