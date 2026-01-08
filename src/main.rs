@@ -16,6 +16,7 @@ const MIN_DETECTION_LEVEL: f32 = 0.01;
 const MAX_VOICES: usize = 3;
 const MIN_CORRELATION: f32 = 0.35;
 const HOLD_FRAMES: usize = 6;
+const ECHO_SUPPRESS_GAIN: f32 = 0.7;
 
 fn main() -> Result<()> {
     run()
@@ -29,7 +30,9 @@ fn run() -> Result<()> {
     let playback_io = playback.io_i16().context("playback IO handle")?;
 
     let mut input = [0i16; CHUNK_SIZE];
+    let mut analysis = [0i16; CHUNK_SIZE];
     let mut output = [0i16; CHUNK_SIZE];
+    let mut echo_tail = [0i16; CHUNK_SIZE];
     let mut phases = [0.0f32; MAX_VOICES];
     let mut last_reported = [0.0f32; MAX_VOICES];
     let mut current_gain = 0.0f32;
@@ -39,10 +42,12 @@ fn run() -> Result<()> {
 
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
-        let level = rms_level(&input);
+        apply_echo_suppression(&input, &echo_tail, ECHO_SUPPRESS_GAIN, &mut analysis);
+
+        let level = rms_level(&analysis);
         let mut pitches = if level >= MIN_DETECTION_LEVEL {
             detect_pitches(
-                &input,
+                &analysis,
                 SAMPLE_RATE,
                 MIN_FREQ,
                 MAX_FREQ,
@@ -102,6 +107,7 @@ fn run() -> Result<()> {
             .collect();
         synthesize_chunk(&mut output, &playback_freqs, &mut phases, current_gain);
         write_chunk(&playback_io, &playback, &output)?;
+        echo_tail.copy_from_slice(&output);
     }
 }
 
@@ -152,6 +158,20 @@ fn write_chunk(io: &IO<i16>, pcm: &PCM, buffer: &[i16]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn apply_echo_suppression(input: &[i16], echo: &[i16], gain: f32, output: &mut [i16]) {
+    debug_assert!(input.len() == output.len());
+    let attenuation = gain.clamp(0.0, 1.0);
+    let limit_min = i16::MIN as f32;
+    let limit_max = i16::MAX as f32;
+
+    for i in 0..output.len() {
+        let in_sample = input.get(i).copied().unwrap_or(0) as f32;
+        let echo_sample = echo.get(i).copied().unwrap_or(0) as f32;
+        let corrected = (in_sample - echo_sample * attenuation).clamp(limit_min, limit_max);
+        output[i] = corrected as i16;
+    }
 }
 
 fn synthesize_chunk(buffer: &mut [i16], freqs: &[f32], phases: &mut [f32], gain: f32) {
