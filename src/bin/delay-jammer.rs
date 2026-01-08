@@ -2,21 +2,31 @@ use alsa::nix::errno::Errno;
 use alsa::pcm::{Access, Format, Frames, HwParams, IO, PCM};
 use alsa::{Direction, ValueOr};
 use anyhow::{Context, Result};
+use clap::Parser;
 use echo_nlms::NlmsCanceller;
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHUNK_SIZE: usize = 4096;
-const DELAY_MS: u32 = 250;
+const DELAY_MS: u32 = 125;
 const AEC_TAPS: usize = 2048;
 const NLMS_STEP_SIZE: f32 = 0.1;
 const MIN_RENDER_LEVEL: f32 = 0.002;
 const DOUBLE_TALK_RATIO: f32 = 2.5;
 
-fn main() -> Result<()> {
-    run()
+#[derive(Parser, Debug)]
+#[command(name = "delay-jammer")]
+struct Args {
+    /// Disable adaptive echo suppression (use when monitoring via headphones).
+    #[arg(long)]
+    disable_echo: bool,
 }
 
-fn run() -> Result<()> {
+fn main() -> Result<()> {
+    let args = Args::parse();
+    run(args.disable_echo)
+}
+
+fn run(disable_echo: bool) -> Result<()> {
     let capture = open_pcm(Direction::Capture).context("failed to open capture PCM")?;
     let playback = open_pcm(Direction::Playback).context("failed to open playback PCM")?;
 
@@ -32,17 +42,24 @@ fn run() -> Result<()> {
     let mut delay_line = vec![0i16; delay_frames];
     let mut delay_pos = 0usize;
 
-    let mut canceller = NlmsCanceller::new(AEC_TAPS, NLMS_STEP_SIZE);
+    let mut canceller = if disable_echo {
+        None
+    } else {
+        Some(NlmsCanceller::new(AEC_TAPS, NLMS_STEP_SIZE))
+    };
 
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
 
-        let render_level = rms_level(&render_history);
-        let capture_level = rms_level(&input);
-        let adapt =
-            render_level > MIN_RENDER_LEVEL && capture_level <= render_level * DOUBLE_TALK_RATIO;
-
-        canceller.process_block(&render_history, &input, &mut cleaned, adapt);
+        if let Some(canceller) = canceller.as_mut() {
+            let render_level = rms_level(&render_history);
+            let capture_level = rms_level(&input);
+            let adapt = render_level > MIN_RENDER_LEVEL
+                && capture_level <= render_level * DOUBLE_TALK_RATIO;
+            canceller.process_block(&render_history, &input, &mut cleaned, adapt);
+        } else {
+            cleaned.copy_from_slice(&input);
+        }
 
         process_delay(&cleaned, &mut output, &mut delay_line, &mut delay_pos);
         write_chunk(&playback_io, &playback, &output)?;

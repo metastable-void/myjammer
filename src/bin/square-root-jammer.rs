@@ -5,6 +5,7 @@ use alsa::nix::errno::Errno;
 use alsa::pcm::{Access, Format, Frames, HwParams, IO, PCM};
 use alsa::{Direction, ValueOr};
 use anyhow::{Context, Result};
+use clap::Parser;
 use echo_nlms::NlmsCanceller;
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -20,11 +21,20 @@ const HOLD_FRAMES: usize = 6;
 const AEC_TAPS: usize = 1024;
 const NLMS_STEP_SIZE: f32 = 0.25;
 
-fn main() -> Result<()> {
-    run()
+#[derive(Parser, Debug)]
+#[command(name = "square-root-jammer")]
+struct Args {
+    /// Disable adaptive echo suppression (use when monitoring via headphones).
+    #[arg(long)]
+    disable_echo: bool,
 }
 
-fn run() -> Result<()> {
+fn main() -> Result<()> {
+    let args = Args::parse();
+    run(args.disable_echo)
+}
+
+fn run(disable_echo: bool) -> Result<()> {
     let capture = open_pcm(Direction::Capture).context("failed to open capture PCM")?;
     let playback = open_pcm(Direction::Playback).context("failed to open playback PCM")?;
 
@@ -41,11 +51,19 @@ fn run() -> Result<()> {
     let mut active_freqs = [0.0f32; MAX_VOICES];
     let mut active_count = 0usize;
     let mut frames_since_detection = HOLD_FRAMES;
-    let mut canceller = NlmsCanceller::new(AEC_TAPS, NLMS_STEP_SIZE);
+    let mut canceller = if disable_echo {
+        None
+    } else {
+        Some(NlmsCanceller::new(AEC_TAPS, NLMS_STEP_SIZE))
+    };
 
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
-        canceller.process_block(&render_history, &input, &mut analysis, true);
+        if let Some(canceller) = canceller.as_mut() {
+            canceller.process_block(&render_history, &input, &mut analysis, true);
+        } else {
+            analysis.copy_from_slice(&input);
+        }
 
         let level = rms_level(&analysis);
         let mut pitches = if level >= MIN_DETECTION_LEVEL {
