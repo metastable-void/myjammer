@@ -7,8 +7,10 @@ use echo_nlms::NlmsCanceller;
 const SAMPLE_RATE: u32 = 48_000;
 const CHUNK_SIZE: usize = 4096;
 const DELAY_MS: u32 = 250;
-const AEC_TAPS: usize = 1024;
-const NLMS_STEP_SIZE: f32 = 0.25;
+const AEC_TAPS: usize = 2048;
+const NLMS_STEP_SIZE: f32 = 0.1;
+const MIN_RENDER_LEVEL: f32 = 0.002;
+const DOUBLE_TALK_RATIO: f32 = 2.5;
 
 fn main() -> Result<()> {
     run()
@@ -35,7 +37,12 @@ fn run() -> Result<()> {
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
 
-        canceller.process_block(&render_history, &input, &mut cleaned);
+        let render_level = rms_level(&render_history);
+        let capture_level = rms_level(&input);
+        let adapt =
+            render_level > MIN_RENDER_LEVEL && capture_level <= render_level * DOUBLE_TALK_RATIO;
+
+        canceller.process_block(&render_history, &input, &mut cleaned, adapt);
 
         process_delay(&cleaned, &mut output, &mut delay_line, &mut delay_pos);
         write_chunk(&playback_io, &playback, &output)?;
@@ -103,4 +110,20 @@ fn process_delay(input: &[i16], output: &mut [i16], delay_line: &mut [i16], dela
 
         output[idx] = delayed;
     }
+}
+
+fn rms_level(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+
+    let sum = samples
+        .iter()
+        .map(|&s| {
+            let v = s as f32;
+            v * v
+        })
+        .sum::<f32>();
+    let rms = (sum / samples.len() as f32).sqrt();
+    (rms / i16::MAX as f32).min(1.0)
 }

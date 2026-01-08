@@ -31,7 +31,13 @@ impl NlmsCanceller {
     ///
     /// Each slice must share the same length. Internally we iterate sample by
     /// sample to update the adaptive filter.
-    pub fn process_block(&mut self, render: &[i16], capture: &[i16], output: &mut [i16]) {
+    pub fn process_block(
+        &mut self,
+        render: &[i16],
+        capture: &[i16],
+        output: &mut [i16],
+        adapt: bool,
+    ) {
         assert_eq!(
             render.len(),
             capture.len(),
@@ -62,7 +68,9 @@ impl NlmsCanceller {
             let error = capture[idx] as f32 - estimate;
             output[idx] = error.clamp(limit_min, limit_max) as i16;
 
-            self.update_taps(error);
+            if adapt {
+                self.update_taps(error);
+            }
         }
     }
 

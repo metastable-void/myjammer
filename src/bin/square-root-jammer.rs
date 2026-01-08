@@ -45,7 +45,7 @@ fn run() -> Result<()> {
 
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
-        canceller.process_block(&render_history, &input, &mut analysis);
+        canceller.process_block(&render_history, &input, &mut analysis, true);
 
         let level = rms_level(&analysis);
         let mut pitches = if level >= MIN_DETECTION_LEVEL {
