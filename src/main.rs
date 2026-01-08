@@ -1,15 +1,17 @@
 use std::f32::consts::{PI, SQRT_2};
 
-use anyhow::{Context, Result};
 use alsa::nix::errno::Errno;
 use alsa::pcm::{Access, Format, Frames, HwParams, IO, PCM};
 use alsa::{Direction, ValueOr};
+use anyhow::{Context, Result};
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHUNK_SIZE: usize = 4096;
 const MIN_FREQ: f32 = 60.0;
 const MAX_FREQ: f32 = 1000.0;
-const OUTPUT_GAIN: f32 = 0.25;
+const MIN_OUTPUT_GAIN: f32 = 0.05;
+const MAX_OUTPUT_GAIN: f32 = 0.8;
+const GAIN_SMOOTHING: f32 = 0.15;
 
 fn main() -> Result<()> {
     run()
@@ -26,6 +28,7 @@ fn run() -> Result<()> {
     let mut output = [0i16; CHUNK_SIZE];
     let mut phase = 0.0f32;
     let mut last_reported = 0.0f32;
+    let mut current_gain = MIN_OUTPUT_GAIN;
 
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
@@ -38,8 +41,12 @@ fn run() -> Result<()> {
             }
         }
 
+        let level = rms_level(&input);
+        let target_gain = MIN_OUTPUT_GAIN + level * (MAX_OUTPUT_GAIN - MIN_OUTPUT_GAIN);
+        current_gain += (target_gain - current_gain) * GAIN_SMOOTHING;
+
         let target_freq = pitch.map(|f| f * SQRT_2).unwrap_or(0.0);
-        synthesize_chunk(&mut output, target_freq, &mut phase);
+        synthesize_chunk(&mut output, target_freq, &mut phase, current_gain);
         write_chunk(&playback_io, &playback, &output)?;
     }
 }
@@ -93,13 +100,13 @@ fn write_chunk(io: &IO<i16>, pcm: &PCM, buffer: &[i16]) -> Result<()> {
     Ok(())
 }
 
-fn synthesize_chunk(buffer: &mut [i16], frequency: f32, phase: &mut f32) {
+fn synthesize_chunk(buffer: &mut [i16], frequency: f32, phase: &mut f32, gain: f32) {
     if frequency <= 0.0 {
         buffer.fill(0);
         return;
     }
 
-    let amplitude = i16::MAX as f32 * OUTPUT_GAIN;
+    let amplitude = i16::MAX as f32 * gain.clamp(0.0, 1.0);
     let phase_step = 2.0 * PI * frequency / SAMPLE_RATE as f32;
 
     for sample in buffer.iter_mut() {
@@ -169,4 +176,20 @@ fn apply_hann_window(samples: &mut [f32]) {
         let weight = 0.5 - 0.5 * (2.0 * PI * n as f32 / denom).cos();
         *sample *= weight;
     }
+}
+
+fn rms_level(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+
+    let sum = samples
+        .iter()
+        .map(|&s| {
+            let v = s as f32;
+            v * v
+        })
+        .sum::<f32>();
+    let rms = (sum / samples.len() as f32).sqrt();
+    (rms / i16::MAX as f32).min(1.0)
 }
