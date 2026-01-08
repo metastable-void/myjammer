@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::f32::consts::{PI, SQRT_2};
 
 use alsa::nix::errno::Errno;
@@ -12,6 +13,8 @@ const MAX_FREQ: f32 = 1000.0;
 const MAX_OUTPUT_GAIN: f32 = 1.0;
 const GAIN_SMOOTHING: f32 = 0.15;
 const MIN_DETECTION_LEVEL: f32 = 0.03;
+const MAX_VOICES: usize = 3;
+const MIN_CORRELATION: f32 = 0.2;
 
 fn main() -> Result<()> {
     run()
@@ -26,31 +29,51 @@ fn run() -> Result<()> {
 
     let mut input = [0i16; CHUNK_SIZE];
     let mut output = [0i16; CHUNK_SIZE];
-    let mut phase = 0.0f32;
-    let mut last_reported = 0.0f32;
+    let mut phases = [0.0f32; MAX_VOICES];
+    let mut last_reported = [0.0f32; MAX_VOICES];
     let mut current_gain = 0.0f32;
 
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
         let level = rms_level(&input);
-        let pitch = if level >= MIN_DETECTION_LEVEL {
-            detect_pitch(&input, SAMPLE_RATE, MIN_FREQ, MAX_FREQ)
+        let pitches = if level >= MIN_DETECTION_LEVEL {
+            detect_pitches(
+                &input,
+                SAMPLE_RATE,
+                MIN_FREQ,
+                MAX_FREQ,
+                MAX_VOICES,
+                MIN_CORRELATION,
+            )
         } else {
-            None
+            Vec::new()
         };
 
-        if let Some(freq) = pitch {
-            if (freq - last_reported).abs() > 3.0 {
-                println!("Detected {:.1} Hz -> playing {:.1} Hz", freq, freq * SQRT_2);
-                last_reported = freq;
+        if !pitches.is_empty() {
+            for idx in 0..MAX_VOICES {
+                if let Some(&freq) = pitches.get(idx) {
+                    if (freq - last_reported[idx]).abs() > 3.0 {
+                        println!(
+                            "Voice {}: {:.1} Hz -> {:.1} Hz",
+                            idx + 1,
+                            freq,
+                            freq * SQRT_2
+                        );
+                        last_reported[idx] = freq;
+                    }
+                } else {
+                    last_reported[idx] = 0.0;
+                }
             }
+        } else {
+            last_reported.fill(0.0);
         }
 
         let target_gain = (level * MAX_OUTPUT_GAIN).min(MAX_OUTPUT_GAIN);
         current_gain += (target_gain - current_gain) * GAIN_SMOOTHING;
 
-        let target_freq = pitch.map(|f| f * SQRT_2).unwrap_or(0.0);
-        synthesize_chunk(&mut output, target_freq, &mut phase, current_gain);
+        let playback_freqs: Vec<f32> = pitches.iter().map(|f| f * SQRT_2).collect();
+        synthesize_chunk(&mut output, &playback_freqs, &mut phases, current_gain);
         write_chunk(&playback_io, &playback, &output)?;
     }
 }
@@ -104,27 +127,46 @@ fn write_chunk(io: &IO<i16>, pcm: &PCM, buffer: &[i16]) -> Result<()> {
     Ok(())
 }
 
-fn synthesize_chunk(buffer: &mut [i16], frequency: f32, phase: &mut f32, gain: f32) {
-    if frequency <= 0.0 {
+fn synthesize_chunk(buffer: &mut [i16], freqs: &[f32], phases: &mut [f32], gain: f32) {
+    if freqs.is_empty() || gain <= 0.0 {
         buffer.fill(0);
+        phases.fill(0.0);
         return;
     }
 
-    let amplitude = i16::MAX as f32 * gain.clamp(0.0, 1.0);
-    let phase_step = 2.0 * PI * frequency / SAMPLE_RATE as f32;
+    let normalized_gain = gain.clamp(0.0, 1.0);
+    let amplitude = i16::MAX as f32 * (normalized_gain / freqs.len() as f32);
 
     for sample in buffer.iter_mut() {
-        *sample = (amplitude * (*phase).sin()) as i16;
-        *phase += phase_step;
-        if *phase > 2.0 * PI {
-            *phase -= 2.0 * PI;
+        let mut acc = 0.0f32;
+        for (idx, freq) in freqs.iter().enumerate() {
+            let phase = &mut phases[idx];
+            acc += (*phase).sin();
+            let phase_step = 2.0 * PI * freq / SAMPLE_RATE as f32;
+            *phase += phase_step;
+            if *phase > 2.0 * PI {
+                *phase -= 2.0 * PI;
+            }
         }
+        let value = (acc * amplitude).clamp(i16::MIN as f32, i16::MAX as f32);
+        *sample = value as i16;
+    }
+
+    for idx in freqs.len()..phases.len() {
+        phases[idx] = 0.0;
     }
 }
 
-fn detect_pitch(samples: &[i16], sample_rate: u32, min_hz: f32, max_hz: f32) -> Option<f32> {
-    if samples.is_empty() {
-        return None;
+fn detect_pitches(
+    samples: &[i16],
+    sample_rate: u32,
+    min_hz: f32,
+    max_hz: f32,
+    max_results: usize,
+    min_correlation: f32,
+) -> Vec<f32> {
+    if samples.is_empty() || max_results == 0 {
+        return Vec::new();
     }
 
     let mut floated: Vec<f32> = samples.iter().map(|&s| s as f32).collect();
@@ -138,18 +180,17 @@ fn detect_pitch(samples: &[i16], sample_rate: u32, min_hz: f32, max_hz: f32) -> 
 
     let len = floated.len();
     if len < 2 {
-        return None;
+        return Vec::new();
     }
 
     let min_period = ((sample_rate as f32) / max_hz).floor() as usize;
     let max_period = ((sample_rate as f32) / min_hz).ceil() as usize;
 
     if min_period < 2 || max_period >= len || min_period >= max_period {
-        return None;
+        return Vec::new();
     }
 
-    let mut best_lag = 0usize;
-    let mut best_corr = f32::MIN;
+    let mut correlations: Vec<(usize, f32)> = Vec::with_capacity(max_period - min_period + 1);
 
     for lag in min_period..=max_period {
         let mut sum = 0.0;
@@ -157,17 +198,31 @@ fn detect_pitch(samples: &[i16], sample_rate: u32, min_hz: f32, max_hz: f32) -> 
             sum += floated[i] * floated[i + lag];
         }
         let normalized = sum / (len - lag) as f32;
-        if normalized > best_corr {
-            best_corr = normalized;
-            best_lag = lag;
+        correlations.push((lag, normalized));
+    }
+
+    correlations.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let mut results: Vec<f32> = Vec::new();
+    for (lag, corr) in correlations {
+        if corr < min_correlation {
+            continue;
+        }
+
+        let freq = sample_rate as f32 / lag as f32;
+        let is_distinct = results
+            .iter()
+            .all(|&existing| (existing - freq).abs() > 5.0f32);
+        if is_distinct {
+            results.push(freq);
+        }
+
+        if results.len() == max_results {
+            break;
         }
     }
 
-    if best_lag == 0 || best_corr <= 0.0 {
-        return None;
-    }
-
-    Some(sample_rate as f32 / best_lag as f32)
+    results
 }
 
 fn apply_hann_window(samples: &mut [f32]) {
