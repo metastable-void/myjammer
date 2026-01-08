@@ -7,7 +7,7 @@ use echo_nlms::NlmsCanceller;
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHUNK_SIZE: usize = 4096;
-const DELAY_MS: u32 = 125;
+const DELAY_MS: u32 = 150;
 const AEC_TAPS: usize = 2048;
 const NLMS_STEP_SIZE: f32 = 0.1;
 const MIN_RENDER_LEVEL: f32 = 0.002;
