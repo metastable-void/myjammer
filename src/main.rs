@@ -11,6 +11,7 @@ const MIN_FREQ: f32 = 60.0;
 const MAX_FREQ: f32 = 1000.0;
 const MAX_OUTPUT_GAIN: f32 = 0.8;
 const GAIN_SMOOTHING: f32 = 0.15;
+const MIN_DETECTION_LEVEL: f32 = 0.03;
 
 fn main() -> Result<()> {
     run()
@@ -31,7 +32,12 @@ fn run() -> Result<()> {
 
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
-        let pitch = detect_pitch(&input, SAMPLE_RATE, MIN_FREQ, MAX_FREQ);
+        let level = rms_level(&input);
+        let pitch = if level >= MIN_DETECTION_LEVEL {
+            detect_pitch(&input, SAMPLE_RATE, MIN_FREQ, MAX_FREQ)
+        } else {
+            None
+        };
 
         if let Some(freq) = pitch {
             if (freq - last_reported).abs() > 3.0 {
@@ -40,7 +46,6 @@ fn run() -> Result<()> {
             }
         }
 
-        let level = rms_level(&input);
         let target_gain = (level * MAX_OUTPUT_GAIN).min(MAX_OUTPUT_GAIN);
         current_gain += (target_gain - current_gain) * GAIN_SMOOTHING;
 
