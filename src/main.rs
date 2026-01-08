@@ -9,7 +9,7 @@ const SAMPLE_RATE: u32 = 48_000;
 const CHUNK_SIZE: usize = 4096;
 const MIN_FREQ: f32 = 60.0;
 const MAX_FREQ: f32 = 1000.0;
-const MAX_OUTPUT_GAIN: f32 = 0.8;
+const MAX_OUTPUT_GAIN: f32 = 1.0;
 const GAIN_SMOOTHING: f32 = 0.15;
 const MIN_DETECTION_LEVEL: f32 = 0.03;
 
