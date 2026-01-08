@@ -2,10 +2,13 @@ use alsa::nix::errno::Errno;
 use alsa::pcm::{Access, Format, Frames, HwParams, IO, PCM};
 use alsa::{Direction, ValueOr};
 use anyhow::{Context, Result};
+use echo_nlms::NlmsCanceller;
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHUNK_SIZE: usize = 4096;
 const DELAY_MS: u32 = 250;
+const AEC_TAPS: usize = 1024;
+const NLMS_STEP_SIZE: f32 = 0.25;
 
 fn main() -> Result<()> {
     run()
@@ -19,17 +22,24 @@ fn run() -> Result<()> {
     let playback_io = playback.io_i16().context("playback IO handle")?;
 
     let mut input = [0i16; CHUNK_SIZE];
+    let mut cleaned = [0i16; CHUNK_SIZE];
     let mut output = [0i16; CHUNK_SIZE];
+    let mut render_history = [0i16; CHUNK_SIZE];
 
     let delay_frames = ((SAMPLE_RATE as u64 * DELAY_MS as u64) / 1000).max(1) as usize;
     let mut delay_line = vec![0i16; delay_frames];
     let mut delay_pos = 0usize;
 
+    let mut canceller = NlmsCanceller::new(AEC_TAPS, NLMS_STEP_SIZE);
+
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
 
-        process_delay(&input, &mut output, &mut delay_line, &mut delay_pos);
+        canceller.process_block(&render_history, &input, &mut cleaned);
+
+        process_delay(&cleaned, &mut output, &mut delay_line, &mut delay_pos);
         write_chunk(&playback_io, &playback, &output)?;
+        render_history.copy_from_slice(&output);
     }
 }
 
