@@ -12,9 +12,10 @@ const MIN_FREQ: f32 = 60.0;
 const MAX_FREQ: f32 = 1000.0;
 const MAX_OUTPUT_GAIN: f32 = 1.0;
 const GAIN_SMOOTHING: f32 = 0.15;
-const MIN_DETECTION_LEVEL: f32 = 0.03;
+const MIN_DETECTION_LEVEL: f32 = 0.01;
 const MAX_VOICES: usize = 3;
-const MIN_CORRELATION: f32 = 0.2;
+const MIN_CORRELATION: f32 = 0.35;
+const HOLD_FRAMES: usize = 6;
 
 fn main() -> Result<()> {
     run()
@@ -32,11 +33,14 @@ fn run() -> Result<()> {
     let mut phases = [0.0f32; MAX_VOICES];
     let mut last_reported = [0.0f32; MAX_VOICES];
     let mut current_gain = 0.0f32;
+    let mut active_freqs = [0.0f32; MAX_VOICES];
+    let mut active_count = 0usize;
+    let mut frames_since_detection = HOLD_FRAMES;
 
     loop {
         read_chunk(&capture_io, &capture, &mut input)?;
         let level = rms_level(&input);
-        let pitches = if level >= MIN_DETECTION_LEVEL {
+        let mut pitches = if level >= MIN_DETECTION_LEVEL {
             detect_pitches(
                 &input,
                 SAMPLE_RATE,
@@ -50,29 +54,52 @@ fn run() -> Result<()> {
         };
 
         if !pitches.is_empty() {
-            for idx in 0..MAX_VOICES {
-                if let Some(&freq) = pitches.get(idx) {
-                    if (freq - last_reported[idx]).abs() > 3.0 {
-                        println!(
-                            "Voice {}: {:.1} Hz -> {:.1} Hz",
-                            idx + 1,
-                            freq,
-                            freq * SQRT_2
-                        );
-                        last_reported[idx] = freq;
-                    }
-                } else {
-                    last_reported[idx] = 0.0;
+            if pitches.len() > MAX_VOICES {
+                pitches.truncate(MAX_VOICES);
+            }
+
+            active_count = pitches.len();
+            active_freqs[..active_count].copy_from_slice(&pitches);
+            for idx in active_count..MAX_VOICES {
+                active_freqs[idx] = 0.0;
+                last_reported[idx] = 0.0;
+            }
+
+            for (idx, &freq) in active_freqs.iter().take(active_count).enumerate() {
+                if (freq - last_reported[idx]).abs() > 3.0 {
+                    println!(
+                        "Voice {}: {:.1} Hz -> {:.1} Hz",
+                        idx + 1,
+                        freq,
+                        freq * SQRT_2
+                    );
+                    last_reported[idx] = freq;
                 }
             }
+
+            frames_since_detection = 0;
+        } else if active_count > 0 {
+            if frames_since_detection < HOLD_FRAMES {
+                frames_since_detection += 1;
+            } else {
+                active_count = 0;
+                active_freqs.fill(0.0);
+                last_reported.fill(0.0);
+                phases.fill(0.0);
+                frames_since_detection = HOLD_FRAMES;
+            }
         } else {
-            last_reported.fill(0.0);
+            frames_since_detection = HOLD_FRAMES;
         }
 
         let target_gain = (level * MAX_OUTPUT_GAIN).min(MAX_OUTPUT_GAIN);
         current_gain += (target_gain - current_gain) * GAIN_SMOOTHING;
 
-        let playback_freqs: Vec<f32> = pitches.iter().map(|f| f * SQRT_2).collect();
+        let playback_freqs: Vec<f32> = active_freqs
+            .iter()
+            .take(active_count)
+            .map(|f| f * SQRT_2)
+            .collect();
         synthesize_chunk(&mut output, &playback_freqs, &mut phases, current_gain);
         write_chunk(&playback_io, &playback, &output)?;
     }
@@ -128,7 +155,7 @@ fn write_chunk(io: &IO<i16>, pcm: &PCM, buffer: &[i16]) -> Result<()> {
 }
 
 fn synthesize_chunk(buffer: &mut [i16], freqs: &[f32], phases: &mut [f32], gain: f32) {
-    if freqs.is_empty() || gain <= 0.0 {
+    if freqs.is_empty() {
         buffer.fill(0);
         phases.fill(0.0);
         return;
@@ -190,14 +217,31 @@ fn detect_pitches(
         return Vec::new();
     }
 
+    let mut energy_prefix = vec![0.0f32; len + 1];
+    for (idx, sample) in floated.iter().enumerate() {
+        energy_prefix[idx + 1] = energy_prefix[idx] + sample * sample;
+    }
+
     let mut correlations: Vec<(usize, f32)> = Vec::with_capacity(max_period - min_period + 1);
 
     for lag in min_period..=max_period {
+        let segment_len = len - lag;
+        if segment_len < 2 {
+            continue;
+        }
+
+        let energy_a = energy_prefix[segment_len] - energy_prefix[0];
+        let energy_b = energy_prefix[len] - energy_prefix[lag];
+        let denom = (energy_a * energy_b).sqrt();
+        if denom <= 1e-9 {
+            continue;
+        }
+
         let mut sum = 0.0;
-        for i in 0..(len - lag) {
+        for i in 0..segment_len {
             sum += floated[i] * floated[i + lag];
         }
-        let normalized = sum / (len - lag) as f32;
+        let normalized = (sum / denom).clamp(-1.0, 1.0);
         correlations.push((lag, normalized));
     }
 
